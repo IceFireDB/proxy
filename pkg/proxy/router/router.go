@@ -1,0 +1,704 @@
+// Copyright 2014 Wandoujia Inc. All Rights Reserved.
+// Licensed under the MIT (MIT-LICENSE.txt) license.
+
+package router
+
+import (
+	"bufio"
+	"fmt"
+	"github.com/IceFireDB/kit/pkg/models/client"
+	"io"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	topo "github.com/IceFireDB/proxy/pkg/proxy/router/topology"
+
+	"github.com/IceFireDB/kit/pkg/models"
+	"github.com/IceFireDB/proxy/pkg/proxy/group"
+	"github.com/IceFireDB/proxy/pkg/proxy/parser"
+	"github.com/IceFireDB/proxy/pkg/proxy/redispool"
+
+	"github.com/IceFireDB/proxy/pkg/proxy/cachepool"
+
+	"github.com/juju/errors"
+	stats "github.com/ngaut/gostats"
+	log "github.com/ngaut/logging"
+	"github.com/ngaut/tokenlimiter"
+)
+
+var slot_num int = 128
+
+type Slot struct {
+	slotInfo    *models.Slot
+	groupInfo   *models.ServerGroup
+	dst         *group.Group
+	migrateFrom *group.Group
+}
+
+type OnSuicideFun func() error
+
+// change field not allowed whitout Lock()
+type Server struct {
+	mu     sync.RWMutex
+	slots  []*Slot
+	top    *topo.Topology
+	store  *models.Store
+	evtbus chan client.Event
+
+	lastActionSeq     string
+	pi                models.ProxyInfo
+	startAt           time.Time
+	addr              string
+	concurrentLimiter *tokenlimiter.TokenLimiter
+
+	moper *MultiOperator
+	pools *cachepool.CachePool
+	// counter
+	counter     *stats.Counters
+	OnSuicide   OnSuicideFun
+	net_timeout int // seconds
+
+	broker string
+}
+
+func (s *Server) clearSlot(i int) {
+	if !validSlot(i) {
+		return
+	}
+
+	if s.slots[i] != nil {
+		s.slots[i].dst = nil
+		s.slots[i].migrateFrom = nil
+		s.slots[i] = nil
+	}
+}
+
+// use it in lock
+func (s *Server) fillSlot(i int, force bool) {
+	if !validSlot(i) {
+		return
+	}
+
+	if !force && s.slots[i] != nil { // check
+		log.Fatalf("slot %d already filled, slot: %+v", i, s.slots[i])
+		return
+	}
+
+	log.Infof("fill slot %d, force %v", i, force)
+
+	s.clearSlot(i)
+
+	slotInfo, groupInfo, err := s.top.GetSlotByIndex(i)
+	if err != nil {
+		log.Fatal(errors.ErrorStack(err))
+	}
+
+	slot := &Slot{
+		slotInfo:  slotInfo,
+		dst:       group.NewGroup(*groupInfo),
+		groupInfo: groupInfo,
+	}
+
+	// s.pools.AddPool(slot.dst.Master())
+
+	if slot.slotInfo.State.Status == models.SLOT_STATUS_MIGRATE {
+		// get migrate src group and fill it
+		from, err := s.top.GetGroup(slot.slotInfo.State.MigrateStatus.From)
+		if err != nil { // todo: retry ?
+			log.Fatal(err)
+		}
+		slot.migrateFrom = group.NewGroup(*from)
+		// s.pools.AddPool(slot.migrateFrom.Master())
+	}
+
+	s.slots[i] = slot
+	s.counter.Add("FillSlot", 1)
+}
+
+func (s *Server) handleMigrateState(slotIndex int, op string, group string, keys [][]byte) error {
+	shd := s.slots[slotIndex]
+	if shd.slotInfo.State.Status != models.SLOT_STATUS_MIGRATE {
+		return nil
+	}
+
+	if shd.migrateFrom == nil {
+		log.Fatalf("migrateFrom not exist %+v", shd)
+	}
+
+	if shd.dst.Master() == shd.migrateFrom.Master() {
+		log.Fatalf("the same migrate src and dst, %+v", shd)
+	}
+
+	redisConn, err := s.pools.GetConn(shd.migrateFrom.Master())
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	defer s.pools.ReleaseConn(redisConn)
+
+	//if redisConn.(*redispool.PooledConn).DB != slotIndex {
+	//	if err := selectDB(redisConn.(*redispool.PooledConn), slotIndex, s.net_timeout); err != nil {
+	//		redisConn.Close()
+	//		return errors.Trace(err)
+	//	}
+	//	redisConn.(*redispool.PooledConn).DB = slotIndex
+	//}
+
+	redisReader := redisConn.(*redispool.PooledConn).BufioReader()
+
+	// migrate multi keys
+	for _, key := range keys {
+		if s.broker == LedisBroker {
+			err = ledisWriteMigrateKeyCmd(redisConn.(*redispool.PooledConn), shd.dst.Master(), 30*1000, group, key, slotIndex)
+		} else {
+			err = writeMigrateKeyCmd(redisConn.(*redispool.PooledConn), shd.dst.Master(), 30*1000, key, slotIndex)
+		}
+
+		if err != nil {
+			redisConn.Close()
+			log.Warningf("migrate key %s error", string(key))
+			return errors.Trace(err)
+		}
+
+		// handle migrate result
+		resp, err := parser.Parse(redisReader)
+		if err != nil {
+			redisConn.Close()
+			return errors.Trace(err)
+		}
+
+		result, err := resp.Bytes()
+
+		log.Debug("migrate", string(key), "from", shd.migrateFrom.Master(), "to", shd.dst.Master(),
+			string(result))
+
+		if resp.Type == parser.ErrorResp {
+			redisConn.Close()
+			log.Error(string(key), string(resp.Raw), "migrateFrom", shd.migrateFrom.Master())
+			return errors.New(string(resp.Raw))
+		}
+
+		s.counter.Add("Migrate", 1)
+	}
+
+	return nil
+}
+
+func (s *Server) filter(opstr string, keys [][]byte, c *session) (next bool, err error) {
+	if !allowOp(opstr) {
+		return false, errors.Trace(fmt.Errorf("%s not allowed", opstr))
+	}
+
+	shouldClose, handled, err := handleSpecCommand(opstr, c, keys, s.net_timeout)
+	if shouldClose { // quit command
+		return false, errors.Trace(io.EOF)
+	}
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	if handled {
+		return false, nil
+	}
+
+	if isMulOp(opstr) {
+		if len(keys) == 1 { // can send to redis directly
+			return true, nil
+		} else {
+			return false, s.moper.handleMultiOp(opstr, keys, c)
+		}
+	}
+
+	return true, nil
+}
+
+func (s *Server) redisTunnel(c *session) error {
+	resp, err := parser.Parse(c.r) // read client request
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	op, keys, err := resp.GetOpKeys()
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	opstr := strings.ToUpper(string(op))
+
+	var group string
+	group, keys, err = s.getOpGroupKeys(opstr, keys)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	if len(keys) == 0 {
+		keys = [][]byte{[]byte("fakeKey")}
+	}
+
+	start := time.Now()
+	k := keys[0]
+
+	// log.Debugf("op: %s, %s", opstr, keys[0])
+	next, err := s.filter(opstr, keys, c)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	s.counter.Add(opstr, 1)
+	s.counter.Add("ops", 1)
+	if !next {
+		return nil
+	}
+
+	// must check multi keys in same slot
+	i, mkeys, err := checkMigrateKeys(opstr, keys)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	// i := mapKey2Slot(k)
+	token := s.concurrentLimiter.Get()
+
+check_state:
+	s.mu.RLock()
+	if s.slots[i] == nil {
+		s.mu.RUnlock()
+		s.concurrentLimiter.Put(token)
+		return errors.Errorf("should never happend, slot %d is empty", i)
+	}
+	// wait for state change, should be soon
+	if s.slots[i].slotInfo.State.Status == models.SLOT_STATUS_PRE_MIGRATE {
+		s.mu.RUnlock()
+		time.Sleep(10 * time.Millisecond)
+		goto check_state
+	}
+
+	defer func() {
+		s.mu.RUnlock()
+		sec := time.Since(start).Seconds()
+		if sec > 2 {
+			log.Warningf("op: %s, key:%s, on: %s, too long %d seconds, client: %s", opstr,
+				string(k), s.slots[i].dst.Master(), int(sec), c.RemoteAddr().String())
+		}
+		recordResponseTime(s.counter, time.Duration(sec)*1000)
+		s.concurrentLimiter.Put(token)
+	}()
+
+	if err := s.handleMigrateState(i, opstr, group, mkeys); err != nil {
+		return errors.Trace(err)
+	}
+
+	// get redis connection
+	redisConn, err := s.pools.GetConn(s.slots[i].dst.Master())
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	//if redisConn.(*redispool.PooledConn).DB != i {
+	//	if err := selectDB(redisConn.(*redispool.PooledConn), i, s.net_timeout); err != nil {
+	//		redisConn.Close()
+	//		s.pools.ReleaseConn(redisConn)
+	//
+	//		return errors.Trace(err)
+	//	}
+	//	redisConn.(*redispool.PooledConn).DB = i
+	//}
+
+	redisErr, clientErr := forward(c, redisConn.(*redispool.PooledConn), resp, s.net_timeout)
+	if redisErr != nil {
+		redisConn.Close()
+	}
+	s.pools.ReleaseConn(redisConn)
+	return errors.Trace(clientErr)
+}
+
+// for ledisdb, we must know the op data type (group) for migration.
+func (s *Server) getOpGroupKeys(op string, keys [][]byte) (string, [][]byte, error) {
+	op = strings.ToUpper(op)
+
+	if s.broker != LedisBroker {
+		return "ALL", keys, nil
+	}
+
+	group, ok := whiteTypeCommand[op]
+	if ok {
+		return group, keys, nil
+	}
+
+	// below commands, the first arg is group
+	_, ok = whiteXCommand[op]
+	if ok {
+		if len(keys) < 2 {
+			return "", nil, fmt.Errorf("%s must have a data type and at least a key", op)
+		}
+		return strings.ToUpper(string(keys[0])), keys[1:], nil
+	}
+
+	return "", nil, fmt.Errorf("%s is not supported now", op)
+}
+
+func (s *Server) handleConn(c net.Conn) {
+	log.Info("new connection", c.RemoteAddr())
+
+	s.counter.Add("connections", 1)
+	client := &session{
+		Conn:     c,
+		r:        bufio.NewReader(c),
+		CreateAt: time.Now(),
+	}
+
+	var err error
+
+	defer func() {
+		if err != nil { // todo: fix this ugly error check
+			if GetOriginError(err.(*errors.Err)).Error() != io.EOF.Error() {
+				log.Warningf("close connection %v, %+v, %v", c.RemoteAddr(), client, errors.ErrorStack(err))
+			} else {
+				log.Infof("close connection %v, %+v", c.RemoteAddr(), client)
+			}
+		} else {
+			log.Infof("close connection %v, %+v", c.RemoteAddr(), client)
+		}
+
+		c.Close()
+		s.counter.Add("connections", -1)
+	}()
+
+	for {
+		err = s.redisTunnel(client)
+		if err != nil {
+			return
+		}
+		client.Ops++
+	}
+}
+
+func (s *Server) OnSlotRangeChange(param *models.SlotMultiSetParam) {
+	log.Warningf("slotRangeChange %+v", param)
+	if !validSlot(param.From) || !validSlot(param.To) {
+		log.Errorf("invalid slot number, %+v", param)
+		return
+	}
+
+	for i := param.From; i <= param.To; i++ {
+		switch param.Status {
+		case models.SLOT_STATUS_OFFLINE:
+			s.clearSlot(i)
+		case models.SLOT_STATUS_ONLINE:
+			s.fillSlot(i, true)
+		default:
+			log.Errorf("can not handle status %v", param.Status)
+		}
+	}
+}
+
+func (s *Server) OnGroupChange(groupId int) {
+	log.Warning("group changed", groupId)
+
+	for i, slot := range s.slots {
+		if slot.slotInfo.GroupId == groupId {
+			s.fillSlot(i, true)
+		}
+	}
+}
+
+func (s *Server) Run() {
+	log.Info("listening on", s.addr)
+	listener, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Warning(errors.ErrorStack(err))
+			continue
+		}
+		go s.handleConn(conn)
+	}
+}
+
+func (s *Server) getProxyInfo() models.ProxyInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pi := s.pi
+	return pi
+}
+
+func (s *Server) getActionObject(seq string, target interface{}) {
+	act := &models.Action{Target: target}
+	err := s.top.GetActionWithSeqObject(seq, act)
+	if err != nil {
+		log.Fatal(errors.ErrorStack(err))
+	}
+
+	log.Infof("%+v", act)
+}
+
+func (s *Server) checkAndDoTopoChange(seq string) (needResponse bool) {
+	log.Debugf("start process action seq %s", seq)
+	act, err := s.top.GetActionWithSeq(seq)
+	if err != nil {
+		log.Fatal(errors.ErrorStack(err), "action seq", seq)
+	}
+
+	//if !StringsContain(act.Receivers, s.pi.Id) { // no need to response
+	//	return false
+	//}
+
+	switch act.Type {
+	case models.ACTION_TYPE_SLOT_MIGRATE, models.ACTION_TYPE_SLOT_CHANGED,
+		models.ACTION_TYPE_SLOT_PREMIGRATE:
+		slot := &models.Slot{}
+		s.getActionObject(seq, slot)
+		s.fillSlot(slot.Id, true)
+	case models.ACTION_TYPE_SERVER_GROUP_CHANGED:
+		serverGroup := &models.ServerGroup{}
+		s.getActionObject(seq, serverGroup)
+		s.OnGroupChange(serverGroup.Id)
+	case models.ACTION_TYPE_SERVER_GROUP_REMOVE:
+		// do not care
+	case models.ACTION_TYPE_MULTI_SLOT_CHANGED:
+		param := &models.SlotMultiSetParam{}
+		s.getActionObject(seq, param)
+		s.OnSlotRangeChange(param)
+	default:
+		log.Fatalf("unknown action %+v", act)
+	}
+
+	return true
+}
+
+func (s *Server) handleMarkOffline() {
+	s.top.Close(s.pi.Id)
+	if s.OnSuicide == nil {
+		s.OnSuicide = func() error {
+			log.Fatalf("suicide %+v", s.pi)
+			return nil
+		}
+	}
+
+	s.OnSuicide()
+}
+
+func (s *Server) handleProxyCommand() {
+	pi, err := s.top.GetProxyInfo(s.pi.Id)
+	if err != nil {
+		log.Fatal(errors.ErrorStack(err))
+	}
+
+	if pi.State == models.PROXY_STATE_MARK_OFFLINE {
+		s.handleMarkOffline()
+	}
+}
+
+func (s *Server) processAction(e client.Event) {
+	start := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if time.Since(start).Seconds() > 10 {
+		log.Warning("take too long to get lock")
+	}
+
+	// todo proxy offline not by action
+	//actPath := GetEventPath(e)
+	//if strings.Index(actPath, s.store.ProxyDir()) == 0 {
+	//	// proxy event, should be order for me to suicide
+	//	s.handleProxyCommand()
+	//	return
+	//}
+
+	// re-watch
+	nodes, err := s.top.WatchAction(s.evtbus)
+	if err != nil {
+		log.Fatal(errors.ErrorStack(err))
+	}
+
+	seqs, err := models.ExtraSeqList(nodes)
+	if err != nil {
+		log.Fatal(errors.ErrorStack(err))
+	}
+
+	if len(seqs) == 0 || !s.top.IsChildrenChangedEvent(e){
+		return
+	}
+	log.Debugf("receive children changed event")
+
+	// get last pos
+	index := -1
+	for i, seq := range seqs {
+		if strings.Compare(s.lastActionSeq, seq) < 0 {
+			index = i
+			break
+		}
+	}
+
+	if index < 0 {
+		log.Warningf("zookeeper restarted or actions were deleted ? lastActionSeq: %d", s.lastActionSeq)
+		if strings.Compare(s.lastActionSeq, seqs[len(seqs)-1]) > 0 {
+			log.Fatalf("unknown error, zookeeper restarted or actions were deleted ? lastActionSeq: %d, %v", s.lastActionSeq, nodes)
+		}
+
+		if strings.Compare(s.lastActionSeq, seqs[len(seqs)-1]) == 0 { // children change or delete event
+			return
+		}
+
+		// actions node was remove by someone, seems we can handle it
+		index = 0
+	}
+
+	actions := seqs[index:]
+	for _, seq := range actions {
+		// todo add response back?
+		//exist, err := s.top.Exist(path.Join(s.top.GetActionResponsePath(seq), s.pi.Id))
+		//if err != nil {
+		//	log.Fatal(errors.ErrorStack(err))
+		//}
+		//
+		//if exist {
+		//	continue
+		//}
+		s.checkAndDoTopoChange(seq)
+	}
+
+	s.lastActionSeq = seqs[len(seqs)-1]
+}
+
+func (s *Server) handleTopoEvent() {
+	for {
+		select {
+		case e := <-s.evtbus:
+			log.Infof("got event %s, %v", s.pi.Id, e)
+			s.processAction(e)
+		}
+	}
+}
+
+//func (s *Server) waitOnline() {
+//	s.mu.Lock()
+//	defer s.mu.Unlock()
+//
+//	for {
+//		pi, err := s.top.GetProxyInfo(s.pi.Id)
+//		if err != nil {
+//			log.Fatal(errors.ErrorStack(err))
+//		}
+//
+//		if pi.State == models.PROXY_STATE_MARK_OFFLINE {
+//			s.handleMarkOffline()
+//		}
+//
+//		if pi.State == models.PROXY_STATE_ONLINE {
+//			s.pi.State = pi.State
+//			println("good, we are on line", s.pi.Id)
+//			log.Info("we are online", s.pi.Id)
+//			_, err := s.top.WatchNode(path.Join(models.GetProxyPath(s.top.ProductName), s.pi.Id), s.evtbus)
+//			if err != nil {
+//				log.Fatal(errors.ErrorStack(err))
+//			}
+//
+//			return
+//		}
+//
+//		println("wait to be online ", s.pi.Id)
+//		log.Warning(s.pi.Id, "wait to be online")
+//
+//		time.Sleep(3 * time.Second)
+//	}
+//}
+
+func (s *Server) FillSlots() {
+	s.slots = make([]*Slot, slot_num)
+	for i := 0; i < slot_num; i++ {
+		s.fillSlot(i, false)
+	}
+}
+
+func (s *Server) InitActionPosition() error {
+	seqs, err := s.top.GetActionSeqList()
+	if err != nil {
+		return err
+	}
+	if len(seqs) != 0 {
+		s.lastActionSeq = seqs[len(seqs) - 1]
+	}
+	return nil
+}
+
+//func (s *Server) RegisterAndWait() {
+//	_, err := s.top.CreateProxyInfo(&s.pi)
+//	if err != nil {
+//		log.Fatal(errors.ErrorStack(err))
+//	}
+//
+//	s.waitOnline()
+//}
+
+func NewServer(addr string, debugVarAddr string, conf *Conf) *Server {
+	log.Infof("%+v", conf)
+	c, err := models.NewClient(conf.coordinatorType, conf.coordinatorAddr, "", time.Second*5)
+	if err != nil {
+		panic(err)
+	}
+	store := models.NewStore(c, conf.productName)
+	s := &Server{
+		evtbus:            make(chan client.Event, 100),
+		top:               topo.NewTopo(conf.productName, store),
+		net_timeout:       conf.net_timeout,
+		counter:           stats.NewCounters("router"),
+		lastActionSeq:     "",
+		startAt:           time.Now(),
+		addr:              addr,
+		concurrentLimiter: tokenlimiter.NewTokenLimiter(100),
+		moper:             NewMultiOperator(addr),
+		pools:             cachepool.NewCachePool(),
+	}
+	s.store = store
+
+	s.broker = conf.broker
+
+	slot_num = conf.slot_num
+
+	s.mu.Lock()
+	s.pi.Id = conf.proxyId
+	s.pi.State = models.PROXY_STATE_ONLINE
+	hname, err := os.Hostname()
+	if err != nil {
+		log.Fatal("get host name failed", err)
+	}
+	s.pi.Addr = hname + ":" + strings.Split(addr, ":")[1]
+	s.pi.DebugVarAddr = hname + ":" + strings.Split(debugVarAddr, ":")[1]
+	log.Infof("proxy_info:%+v", s.pi)
+	s.mu.Unlock()
+	//todo:fill more field
+
+	stats.Publish("evtbus", stats.StringFunc(func() string {
+		return strconv.Itoa(len(s.evtbus))
+	}))
+	stats.Publish("startAt", stats.StringFunc(func() string {
+		return s.startAt.String()
+	}))
+
+	// s.RegisterAndWait()
+
+	s.InitActionPosition()
+	_, err = s.top.WatchAction(s.evtbus)
+	if err != nil {
+		log.Fatal(errors.ErrorStack(err))
+	}
+
+
+	s.FillSlots()
+
+	// start event handler
+	go s.handleTopoEvent()
+
+	log.Info("proxy start ok")
+
+	return s
+}
