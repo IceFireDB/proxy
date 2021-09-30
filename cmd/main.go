@@ -4,14 +4,13 @@
 package main
 
 import (
-	"github.com/IceFireDB/proxy/pkg/proxy/router"
 	"net/http"
 	_ "net/http/pprof"
-	"path"
 
+	log "github.com/IceFireDB/kit/pkg/logger"
+	"github.com/IceFireDB/proxy/pkg/proxy/router"
 	"github.com/docopt/docopt-go"
 	"github.com/ledisdb/xcodis/utils"
-	log "github.com/ngaut/logging"
 	_ "go.uber.org/automaxprocs"
 )
 
@@ -38,14 +37,14 @@ options:
 `
 
 func handleSetLogLevel(w http.ResponseWriter, r *http.Request) {
-	r.ParseForm()
-	level := r.Form.Get("level")
-	log.SetLevelByString(level)
-	log.Info("set log level to", level)
+	// r.ParseForm()
+	// level := r.Form.Get("level")
+	// log.SetLevelByString(level)
+	// log.Info("set log level to", level)
 }
 
 func main() {
-	log.SetLevelByString("info")
+	log.Init("proxy", log.WithOutputLevelString("info"))
 
 	args, err := docopt.Parse(usage, nil, true, "codis proxy v0.1", true)
 	if err != nil {
@@ -58,14 +57,14 @@ func main() {
 	}
 
 	// set output log file
-	if args["-L"] != nil {
-		log.SetOutputByName(args["-L"].(string))
-	}
-
-	// set log level
-	if args["--log-level"] != nil {
-		log.SetLevelByString(args["--log-level"].(string))
-	}
+	//if args["-L"] != nil {
+	//	log.SetOutputByName(args["-L"].(string))
+	//}
+	//
+	//// set log level
+	//if args["--log-level"] != nil {
+	//	log.SetLevelByString(args["--log-level"].(string))
+	//}
 
 	// set addr
 	if args["--addr"] != nil {
@@ -85,7 +84,7 @@ func main() {
 	dumppath := utils.GetExecutorPath()
 
 	log.Info("dump file path:", dumppath)
-	log.CrashLog(path.Join(dumppath, "codis-proxy.dump"))
+	// log.CrashLog(path.Join(dumppath, "codis-proxy.dump"))
 
 	router.CheckUlimit(1024)
 
@@ -98,5 +97,5 @@ func main() {
 	}
 	s := router.NewServer(addr, httpAddr, conf)
 	s.Run()
-	log.Warning("exit")
+	log.Warn("exit")
 }

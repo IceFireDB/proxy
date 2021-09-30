@@ -6,7 +6,7 @@ package group
 import (
 	"github.com/IceFireDB/kit/pkg/models"
 
-	log "github.com/ngaut/logging"
+	log "github.com/IceFireDB/kit/pkg/logger"
 )
 
 type Group struct {

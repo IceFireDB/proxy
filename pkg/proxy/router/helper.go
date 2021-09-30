@@ -14,7 +14,7 @@ import (
 	"github.com/ledisdb/xcodis/utils"
 
 	"github.com/IceFireDB/proxy/pkg/proxy/parser"
-	log "github.com/ngaut/logging"
+	log "github.com/IceFireDB/kit/pkg/logger"
 
 	"github.com/juju/errors"
 	topo "github.com/ngaut/go-zookeeper/zk"
@@ -207,7 +207,7 @@ func GetEventPath(evt interface{}) string {
 func CheckUlimit(min int) {
 	ulimitN, err := exec.Command("/bin/sh", "-c", "ulimit -n").Output()
 	if err != nil {
-		log.Warning("get ulimit failed", err)
+		log.Warn("get ulimit failed", err)
 	}
 
 	n, err := strconv.Atoi(strings.TrimSpace(string(ulimitN)))

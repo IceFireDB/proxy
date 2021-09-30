@@ -7,7 +7,7 @@ import (
 	"github.com/IceFireDB/kit/pkg/models"
 	"github.com/IceFireDB/kit/pkg/models/client"
 	"github.com/juju/errors"
-	log "github.com/ngaut/logging"
+	log "github.com/IceFireDB/kit/pkg/logger"
 )
 
 type TopoUpdate interface {
@@ -100,7 +100,7 @@ func (top *Topology) doWatch(evtch <-chan client.Event, evtbus chan client.Event
 	case client.EventNodeChildrenChanged: // only care children changed
 		//todo:get changed node and decode event
 	default:
-		log.Warningf("%+v", e)
+		log.Warnf("%+v", e)
 	}
 
 	evtbus <- e

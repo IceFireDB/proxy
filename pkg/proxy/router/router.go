@@ -26,7 +26,7 @@ import (
 
 	"github.com/juju/errors"
 	stats "github.com/ngaut/gostats"
-	log "github.com/ngaut/logging"
+	log "github.com/IceFireDB/kit/pkg/logger"
 	"github.com/ngaut/tokenlimiter"
 )
 
@@ -160,7 +160,7 @@ func (s *Server) handleMigrateState(slotIndex int, op string, group string, keys
 
 		if err != nil {
 			redisConn.Close()
-			log.Warningf("migrate key %s error", string(key))
+			log.Warnf("migrate key %s error", string(key))
 			return errors.Trace(err)
 		}
 
@@ -280,7 +280,7 @@ check_state:
 		s.mu.RUnlock()
 		sec := time.Since(start).Seconds()
 		if sec > 2 {
-			log.Warningf("op: %s, key:%s, on: %s, too long %d seconds, client: %s", opstr,
+			log.Warnf("op: %s, key:%s, on: %s, too long %d seconds, client: %s", opstr,
 				string(k), s.slots[i].dst.Master(), int(sec), c.RemoteAddr().String())
 		}
 		recordResponseTime(s.counter, time.Duration(sec)*1000)
@@ -355,7 +355,7 @@ func (s *Server) handleConn(c net.Conn) {
 	defer func() {
 		if err != nil { // todo: fix this ugly error check
 			if GetOriginError(err.(*errors.Err)).Error() != io.EOF.Error() {
-				log.Warningf("close connection %v, %+v, %v", c.RemoteAddr(), client, errors.ErrorStack(err))
+				log.Warnf("close connection %v, %+v, %v", c.RemoteAddr(), client, errors.ErrorStack(err))
 			} else {
 				log.Infof("close connection %v, %+v", c.RemoteAddr(), client)
 			}
@@ -377,7 +377,7 @@ func (s *Server) handleConn(c net.Conn) {
 }
 
 func (s *Server) OnSlotRangeChange(param *models.SlotMultiSetParam) {
-	log.Warningf("slotRangeChange %+v", param)
+	log.Warnf("slotRangeChange %+v", param)
 	if !validSlot(param.From) || !validSlot(param.To) {
 		log.Errorf("invalid slot number, %+v", param)
 		return
@@ -396,7 +396,7 @@ func (s *Server) OnSlotRangeChange(param *models.SlotMultiSetParam) {
 }
 
 func (s *Server) OnGroupChange(groupId int) {
-	log.Warning("group changed", groupId)
+	log.Warn("group changed", groupId)
 
 	for i, slot := range s.slots {
 		if slot.slotInfo.GroupId == groupId {
@@ -415,7 +415,7 @@ func (s *Server) Run() {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Warning(errors.ErrorStack(err))
+			log.Warn(errors.ErrorStack(err))
 			continue
 		}
 		go s.handleConn(conn)
@@ -502,7 +502,7 @@ func (s *Server) processAction(e client.Event) {
 	defer s.mu.Unlock()
 
 	if time.Since(start).Seconds() > 10 {
-		log.Warning("take too long to get lock")
+		log.Warn("take too long to get lock")
 	}
 
 	// todo proxy offline not by action
@@ -539,7 +539,7 @@ func (s *Server) processAction(e client.Event) {
 	}
 
 	if index < 0 {
-		log.Warningf("zookeeper restarted or actions were deleted ? lastActionSeq: %d", s.lastActionSeq)
+		log.Warnf("zookeeper restarted or actions were deleted ? lastActionSeq: %d", s.lastActionSeq)
 		if strings.Compare(s.lastActionSeq, seqs[len(seqs)-1]) > 0 {
 			log.Fatalf("unknown error, zookeeper restarted or actions were deleted ? lastActionSeq: %d, %v", s.lastActionSeq, nodes)
 		}
@@ -606,7 +606,7 @@ func (s *Server) handleTopoEvent() {
 //		}
 //
 //		println("wait to be online ", s.pi.Id)
-//		log.Warning(s.pi.Id, "wait to be online")
+//		log.Warn(s.pi.Id, "wait to be online")
 //
 //		time.Sleep(3 * time.Second)
 //	}

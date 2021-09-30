@@ -8,7 +8,7 @@ import (
 
 	"github.com/garyburd/redigo/redis"
 	"github.com/juju/errors"
-	log "github.com/ngaut/logging"
+	log "github.com/IceFireDB/kit/pkg/logger"
 	respcoding "github.com/ngaut/resp"
 )
 
@@ -110,7 +110,7 @@ func (oper *MultiOperator) mget(mop *MulOp) {
 	start := time.Now()
 	defer func() {
 		if sec := time.Since(start).Seconds(); sec > 2 {
-			log.Warning("too long to do mget", sec)
+			log.Warn("too long to do mget", sec)
 		}
 	}()
 
@@ -162,7 +162,7 @@ func (oper *MultiOperator) mset(mop *MulOp) {
 	start := time.Now()
 	defer func() { //todo:extra function
 		if sec := time.Since(start).Seconds(); sec > 2 {
-			log.Warning("too long to do del", sec)
+			log.Warn("too long to do del", sec)
 		}
 	}()
 
@@ -185,7 +185,7 @@ func (oper *MultiOperator) del(mop *MulOp) {
 	start := time.Now()
 	defer func() { //todo:extra function
 		if sec := time.Since(start).Seconds(); sec > 2 {
-			log.Warning("too long to do del", sec)
+			log.Warn("too long to do del", sec)
 		}
 	}()
 
